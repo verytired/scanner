@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scanner</title>
+<style>
+  :root { --bg: #0c0c0e; --fg: #e8e5dc; --dim: #8a877f; --lamp: #5dff8a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 10px 16px; border-bottom: 1px solid #222; }
+  header b { letter-spacing: .2em; margin-right: 6px; }
+  label { display: flex; gap: 6px; align-items: center; color: var(--dim); }
+  select, button, input[type=range] { font: inherit; color: var(--fg); background: #1a1a1d; border: 1px solid #333; border-radius: 3px; padding: 5px 8px; }
+  input[type=range] { padding: 0; width: 90px; accent-color: var(--lamp); }
+  button { cursor: pointer; }
+  button.go { background: var(--lamp); color: #000; border-color: var(--lamp); font-weight: bold; }
+  button.go[disabled] { opacity: .5; cursor: default; }
+  main { flex: 1; display: flex; gap: 12px; padding: 12px 16px 16px; min-height: 0; align-items: center; justify-content: center; }
+  figure { margin: 0; height: 100%; display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 0; min-height: 0; }
+  figcaption { color: var(--dim); font-size: 11px; letter-spacing: .15em; }
+  canvas { max-width: 100%; max-height: calc(100% - 22px); aspect-ratio: 3 / 4; background: #000; touch-action: none; }
+  #bed { cursor: grab; }
+  #bed.drag { cursor: grabbing; }
+  @media (orientation: portrait) {
+    main { flex-direction: column; }
+    figure { height: auto; width: 100%; flex: 1; }
+    canvas { max-height: calc(100% - 22px); height: calc(100% - 22px); width: auto; }
+  }
+  .hint { color: var(--dim); font-size: 11px; margin-left: auto; }
+  video, input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <b>SCANNER</b>
+  <label>source
+    <select id="source">
+      <option value="face">face</option>
+      <option value="dancer">dancer</option>
+      <option value="file">photo / video…</option>
+      <option value="camera">camera</option>
+    </select>
+  </label>
+  <label>direction
+    <select id="dir">
+      <option value="x+">→</option>
+      <option value="x-">←</option>
+      <option value="y+">↓</option>
+      <option value="y-">↑</option>
+    </select>
+  </label>
+  <label>time <input type="range" id="speed" min="1" max="12" step="0.5" value="4"><span id="speedV">4s</span></label>
+  <label>noise <input type="range" id="noise" min="0" max="1" step="0.05" value="0.3"></label>
+  <label><input type="checkbox" id="loop"> repeat</label>
+  <button class="go" id="scan">SCAN</button>
+  <button id="save">save</button>
+  <span class="hint">drag the source while the lamp moves · wheel / pinch to zoom · space to scan</span>
+</header>
+<main>
+  <figure><canvas id="bed"></canvas><figcaption>BED</figcaption></figure>
+  <figure><canvas id="res"></canvas><figcaption>OUTPUT</figcaption></figure>
+</main>
+<video id="v-face" src="src/face_v1.mp4" muted loop playsinline preload="auto"></video>
+<video id="v-dancer" src="src/dancer_v1.mp4" muted loop playsinline preload="auto"></video>
+<video id="v-cam" muted playsinline></video>
+<video id="v-file" muted loop playsinline></video>
+<input type="file" id="file" accept="image/*,video/*">
+
+<script>
+// スキャナーの故障を自分で起こすページ。読み取りの線が進む間に置き台の素材を動かすと、
+// 線が通った瞬間の置き台だけが列（行）ごとに結果に残る。素材は動画なので、動かさなくても動きが写る
+const PW = 720, PH = 960;   // 内部の大きさ（3:4）
+const bed = document.getElementById('bed'), bx = bed.getContext('2d');
+const res = document.getElementById('res'), vx = res.getContext('2d');
+const out = document.createElement('canvas'), rx = out.getContext('2d');   // 結果そのもの（表示は線を重ねて res に）
+const raw = document.createElement('canvas'), wx = raw.getContext('2d');   // 線を描かない置き台（ここから写す）
+[bed, res, out, raw].forEach(k => { k.width = PW; k.height = PH; });
+const GLASS = '#ebe7dc', LAMP = '#5dff8a';
+const $ = id => document.getElementById(id);
+
+// ---- 素材 ----
+let src = $('v-face'), img = null, mirror = false;
+const item = { x: PW / 2, y: PH / 2, s: 1 };   // 置き台の上の位置と拡大率
+const resetItem = () => Object.assign(item, { x: PW / 2, y: PH / 2, s: 1 });
+function useVideo(v) { src = v; img = null; v.play().catch(() => {}); }
+$('source').onchange = async e => {
+  const k = e.target.value; mirror = false;
+  if (k === 'face' || k === 'dancer') useVideo($('v-' + k));
+  else if (k === 'file') $('file').click();
+  else if (k === 'camera') {
+    try {
+      const v = $('v-cam'); v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+      useVideo(v); mirror = true;
+    } catch (err) { alert('camera not available'); e.target.value = 'face'; useVideo($('v-face')); }
+  }
+  resetItem();
+};
+$('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const url = URL.createObjectURL(f);
+  if (f.type.startsWith('video')) { const v = $('v-file'); v.src = url; useVideo(v); }
+  else { const im = new Image(); im.onload = () => { img = im; src = null; }; im.src = url; }
+  resetItem();
+};
+const media = () => img || src;
+const mediaSize = () => img ? [img.naturalWidth, img.naturalHeight] : [src.videoWidth, src.videoHeight];
+const mediaReady = () => img ? img.complete : src && src.readyState >= 2;
+
+// ---- 動かす（ドラッグ・ホイール・ピンチ） ----
+const pts = new Map(); let pinch0 = null;
+const toBed = e => { const r = bed.getBoundingClientRect(); return [(e.clientX - r.left) * PW / r.width, (e.clientY - r.top) * PH / r.height]; };
+bed.onpointerdown = e => { bed.setPointerCapture(e.pointerId); pts.set(e.pointerId, toBed(e)); bed.classList.add('drag'); pinch0 = null; };
+bed.onpointermove = e => {
+  if (!pts.has(e.pointerId)) return;
+  const p = toBed(e), q = pts.get(e.pointerId);
+  if (pts.size === 1) { item.x += p[0] - q[0]; item.y += p[1] - q[1]; }
+  else if (pts.size === 2) {
+    pts.set(e.pointerId, p);
+    const [a, b] = [...pts.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (pinch0) item.s = Math.min(4, Math.max(0.3, item.s * d / pinch0));
+    pinch0 = d; return;
+  }
+  pts.set(e.pointerId, p);
+};
+bed.onpointerup = bed.onpointercancel = e => { pts.delete(e.pointerId); pinch0 = null; if (!pts.size) bed.classList.remove('drag'); };
+bed.onwheel = e => { e.preventDefault(); item.s = Math.min(4, Math.max(0.3, item.s * Math.exp(-e.deltaY * 0.0015))); };
+
+// ---- 置き台を描く ----
+function drawRaw() {
+  wx.fillStyle = GLASS; wx.fillRect(0, 0, PW, PH);
+  wx.strokeStyle = 'rgba(0,0,0,0.07)'; wx.lineWidth = 1;
+  const g = PW / 12; wx.beginPath();
+  for (let x = g; x < PW; x += g) { wx.moveTo(x, 0); wx.lineTo(x, PH); }
+  for (let y = g; y < PH; y += g) { wx.moveTo(0, y); wx.lineTo(PW, y); }
+  wx.stroke();
+  if (!mediaReady()) return;
+  const [mw, mh] = mediaSize(); if (!mw) return;
+  const fit = Math.min(PW * 0.8 / mw, PH * 0.8 / mh) * item.s, w = mw * fit, h = mh * fit;
+  wx.save(); wx.translate(item.x, item.y); if (mirror) wx.scale(-1, 1);
+  wx.filter = 'grayscale(1) contrast(1.5)';
+  wx.shadowColor = 'rgba(0,0,0,0.25)'; wx.shadowBlur = 10; wx.shadowOffsetY = 3;   // 印画紙が少し浮いている
+  wx.drawImage(media(), -w / 2, -h / 2, w, h);
+  wx.restore(); wx.filter = 'none';
+}
+
+// ---- 読み取り ----
+let scan = null;   // { t0, dur, axis, rev, last }
+function clearRes() { rx.fillStyle = GLASS; rx.fillRect(0, 0, PW, PH); }
+function startScan() {
+  audio();
+  const d = $('dir').value, dur = +$('speed').value;
+  scan = { t0: performance.now(), dur, axis: d[0], rev: d[1] === '-', last: 0 };
+  clearRes(); motorOn(dur); $('scan').disabled = true;
+}
+const linePos = (p, s) => { const n = s.axis === 'x' ? PW : PH; return s.rev ? n * (1 - p) : n * p; };
+function scanStep(now) {
+  const s = scan, p = Math.min(1, (now - s.t0) / 1000 / s.dur);
+  const lo = Math.floor(Math.min(linePos(s.last, s), linePos(p, s))), hi = Math.ceil(Math.max(linePos(s.last, s), linePos(p, s)));
+  if (hi > lo) {
+    const nz = +$('noise').value;
+    if (s.axis === 'x') rx.drawImage(raw, lo, 0, hi - lo, PH, lo, 0, hi - lo, PH);
+    else rx.drawImage(raw, 0, lo, PW, hi - lo, 0, lo, PW, hi - lo);
+    if (nz > 0) {   // 読むたびに明るさがぶれる（センサーのむら）
+      rx.globalAlpha = Math.random() * 0.15 * nz; rx.fillStyle = Math.random() < 0.5 ? '#000' : '#fff';
+      if (s.axis === 'x') rx.fillRect(lo, 0, hi - lo, PH); else rx.fillRect(0, lo, PW, hi - lo);
+      rx.globalAlpha = 1;
+    }
+  }
+  s.last = p;
+  if (p >= 1) {
+    scan = null; motorOff(); $('scan').disabled = false;
+    if (nzGrain()) grain();
+    if ($('loop').checked) setTimeout(() => { if (!scan) startScan(); }, 700);
+  }
+  return p;
+}
+const nzGrain = () => +$('noise').value > 0;
+function grain() {   // 読み終えたら細かい粒を少し
+  const d = rx.getImageData(0, 0, PW, PH), a = d.data, k = 40 * +$('noise').value;
+  for (let i = 0; i < a.length; i += 4) { const n = (Math.random() - 0.5) * k; a[i] += n; a[i + 1] += n; a[i + 2] += n; }
+  rx.putImageData(d, 0, 0);
+}
+function lamp(ctx, p, s) {
+  const q = linePos(p, s);
+  ctx.save(); ctx.fillStyle = LAMP; ctx.shadowColor = LAMP; ctx.shadowBlur = 20;
+  if (s.axis === 'x') ctx.fillRect(q - 2, 0, 4, PH); else ctx.fillRect(0, q - 2, PW, 4);
+  ctx.restore();
+}
+
+// ---- 音：キャリッジのモーター ----
+let ac = null, motor, m2, bp, mg;
+function audio() {
+  if (ac) return;
+  ac = new AudioContext();
+  motor = ac.createOscillator(); motor.type = 'sawtooth';
+  m2 = ac.createOscillator(); m2.type = 'square';
+  const m2g = ac.createGain(); m2g.gain.value = 0.3; m2.connect(m2g);
+  bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 3;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+  mg = ac.createGain(); mg.gain.value = 0;
+  motor.connect(bp); m2g.connect(bp); bp.connect(lp); lp.connect(mg); mg.connect(ac.destination);
+  motor.start(); m2.start();
+}
+function motorOn(dur) {   // 速く読むほど高い
+  const t = ac.currentTime, f = Math.min(700, Math.max(45, 440 / dur));
+  motor.frequency.setValueAtTime(f, t); m2.frequency.setValueAtTime(2 * f, t); bp.frequency.setValueAtTime(4 * f, t);
+  mg.gain.setTargetAtTime(0.12, t, 0.02);
+}
+function motorOff() {   // 止まって、速く戻る
+  const t = ac.currentTime, f = motor.frequency.value;
+  mg.gain.setTargetAtTime(0, t, 0.02);
+  const o = ac.createOscillator(), g = ac.createGain(), b = ac.createBiquadFilter();
+  o.type = 'sawtooth'; b.type = 'bandpass'; b.Q.value = 2; b.frequency.value = 6 * f;
+  o.frequency.setValueAtTime(3 * f, t + 0.05); o.frequency.exponentialRampToValueAtTime(f, t + 0.6);
+  g.gain.setValueAtTime(0, t + 0.05); g.gain.linearRampToValueAtTime(0.07, t + 0.1); g.gain.exponentialRampToValueAtTime(0.001, t + 0.65);
+  o.connect(b); b.connect(g); g.connect(ac.destination); o.start(t + 0.05); o.stop(t + 0.7);
+}
+
+// ---- 毎コマ ----
+function frame(now) {
+  requestAnimationFrame(frame);
+  drawRaw();
+  bx.drawImage(raw, 0, 0);
+  const s = scan, p = s ? scanStep(now) : 0;
+  vx.drawImage(out, 0, 0);
+  if (s && scan) { lamp(bx, p, s); lamp(vx, p, s); }
+}
+
+$('speed').oninput = e => $('speedV').textContent = e.target.value + 's';
+$('scan').onclick = () => { if (!scan) startScan(); };
+window.onkeydown = e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT') { e.preventDefault(); if (!scan) startScan(); } };
+$('save').onclick = () => out.toBlob(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = `scan_${Date.now()}.png`; a.click(); });
+clearRes(); useVideo($('v-face'));
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
